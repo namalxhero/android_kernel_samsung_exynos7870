@@ -1,0 +1,156 @@
+name: Build KernelSU kernel (J7 Prime / on7xelte)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "H-KERNEL branch (h-kernel_permissive or h-kernel_enforcing)"
+        default: "h-kernel_permissive"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev ccache zip git curl xz-utils python3
+
+      - name: Get Linaro GCC 7.5 (same toolchain as H-KERNEL)
+        run: |
+          curl -L -o gcc.tar.xz https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
+          mkdir -p $HOME/gcc && tar -xf gcc.tar.xz -C $HOME/gcc --strip-components=1
+          $HOME/gcc/bin/aarch64-linux-gnu-gcc --version | head -1
+
+      - name: Clone H-KERNEL source
+        run: |
+          git clone --depth=1 -b "${{ inputs.branch }}" https://github.com/samsungexynos7870/android_kernel_samsung_exynos7870 kernel
+
+      - name: Add KernelSU (rsuntk legacy tag, supports 3.18)
+        working-directory: kernel
+        run: |
+          git clone --depth=1 -b v3.2.2-10-legacy https://github.com/rsuntk/KernelSU KernelSU
+          rm -rf KernelSU/.git
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          printf 'CONFIG_KSU=y\n# CONFIG_KSU_LSM_HOOKS is not set\n# CONFIG_KSU_DEBUG is not set\n' >> arch/arm64/configs/exynos7870-on7xelte_defconfig
+
+      - name: Apply KernelSU manual hooks (3.18)
+        working-directory: kernel
+        run: |
+          cat > ksu_hooks.py <<'PYEOF'
+          #!/usr/bin/env python3
+          import sys
+
+          def edit(path, anchor, new, after=False):
+              s = open(path).read()
+              if new in s:
+                  print("[skip] already patched:", path)
+                  return
+              if s.count(anchor) != 1:
+                  sys.exit("[ERROR] anchor found %d times in %s:\n%s" % (s.count(anchor), path, anchor))
+              i = s.index(anchor) + (len(anchor) if after else 0)
+              open(path, "w").write(s[:i] + new + s[i:])
+              print("[ok]", path)
+
+          # 1) fs/exec.c
+          edit("fs/exec.c", "static int do_execve_common(struct filename *filename,",
+           "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n\n")
+          edit("fs/exec.c", "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n\n\t/*\n\t * We move the actual failure",
+           "\t{\n\t\tint ksu_fd = AT_FDCWD, ksu_flags = 0;\n\t\tif (!IS_ERR(filename))\n\t\t\tksu_handle_execveat(&ksu_fd, &filename, &argv, &envp, &ksu_flags);\n\t}\n\n")
+
+          # 2) fs/open.c
+          edit("fs/open.c", "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
+           "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n\n")
+          edit("fs/open.c", "\tif (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */",
+           "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n\n")
+
+          # 3) fs/stat.c
+          edit("fs/stat.c", "int vfs_fstat(unsigned int fd, struct kstat *stat)",
+           "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\nextern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);\n\n")
+          edit("fs/stat.c", "\t\terror = vfs_getattr(&f.file->f_path, stat);\n",
+           "\t\tif (!error)\n\t\t\tksu_handle_vfs_fstat(fd, &stat->size);\n", after=True)
+          edit("fs/stat.c", "\tif ((flag & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |\n\t\t      AT_EMPTY_PATH)) != 0)\n\t\tgoto out;\n\n\tif (!(flag & AT_SYMLINK_NOFOLLOW))",
+           "\tksu_handle_stat(&dfd, &filename, &flag);\n\n")
+
+          # 4) fs/read_write.c
+          edit("fs/read_write.c", "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)\n{",
+           "extern bool ksu_vfs_read_hook __read_mostly;\nextern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n\n")
+          edit("fs/read_write.c", "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)\n{\n\tssize_t ret;\n\n",
+           "\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n\n", after=True)
+
+          # 5) kernel/reboot.c
+          edit("kernel/reboot.c", "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
+           "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n\n")
+          edit("kernel/reboot.c", "\t/* We only trust the superuser with rebooting the system. */",
+           "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n\n")
+
+          # 6) security/security.c
+          edit("security/security.c", "int security_task_fix_setuid(struct cred *new, const struct cred *old,",
+           "extern int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int flags);\n\n")
+          edit("security/security.c", "\treturn security_ops->task_fix_setuid(new, old, flags);",
+           "\tksu_task_fix_setuid(new, old, flags);\n")
+          edit("security/security.c", "int security_key_permission(key_ref_t key_ref,",
+           "extern int ksu_key_permission(key_ref_t key_ref, const struct cred *cred, unsigned perm);\n\n")
+          edit("security/security.c", "\treturn security_ops->key_permission(key_ref, cred, perm);",
+           "\tksu_key_permission(key_ref, cred, perm);\n")
+          print("ALL HOOKS APPLIED")
+          PYEOF
+          python3 ksu_hooks.py
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export CROSS_COMPILE=$HOME/gcc/bin/aarch64-linux-gnu-
+          export ANDROID_MAJOR_VERSION=q
+          export ANDROID_PLATFORM_VERSION=10
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' scripts/dtc/dtc-lexer.lex.c_shipped
+          make O=out exynos7870-on7xelte_defconfig
+          grep KSU out/.config
+          make O=out -j$(nproc) KCFLAGS="-Wno-error" Image 2>&1 | tail -40
+          ls -la out/arch/arm64/boot/Image
+
+      - name: Package flashable zip (AnyKernel3)
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git .github README.md modules patch ramdisk
+          cp ../kernel/out/arch/arm64/boot/Image Image
+          cat > anykernel.sh <<'AKEOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=H-KERNEL V1.0 + KernelSU (J7 Prime)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=on7xelte
+          device.name2=on7xeltedd
+          device.name3=on7xeltekx
+          device.name4=SM-G610F
+          device.name5=SM-G610M
+          supported.versions=
+          supported.patchlevels=
+          '; }
+          block=/dev/block/platform/13540000.dwmmc0/by-name/BOOT;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          AKEOF
+          zip -r9 ../KSU-H-KERNEL-on7xelte.zip * -x .git
+          cp Image ../Image
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: KSU-H-KERNEL-on7xelte
+          path: |
+            KSU-H-KERNEL-on7xelte.zip
+            Image
