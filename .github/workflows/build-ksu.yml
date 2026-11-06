@@ -12,6 +12,9 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
+      - name: Checkout repo (for boot.img)
+        uses: actions/checkout@v4
+
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -35,12 +38,15 @@ jobs:
           echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           printf 'CONFIG_KSU=y\n# CONFIG_KSU_LSM_HOOKS is not set\n# CONFIG_KSU_DEBUG is not set\n' >> arch/arm64/configs/exynos7870-on7xelte_defconfig
+          sed -i 's/d_is_reg(/d_is_file(/' KernelSU/kernel/runtime/ksud.c
+          sed -i 's/long ret = (long)ns_get_path(&ns_path, pid1_task, &mntns_operations);/long ret = -ENOSYS; ns_path.mnt = NULL; ns_path.dentry = NULL;/' KernelSU/kernel/infra/su_mount_ns.c
 
       - name: Apply KernelSU manual hooks (3.18)
         working-directory: kernel
         run: |
           cat > ksu_hooks.py <<'PYEOF'
           #!/usr/bin/env python3
+          # KernelSU manual hooks for Linux 3.18 (Exynos7870 H-KERNEL). Run from the kernel source root.
           import sys
 
           def edit(path, anchor, new, after=False):
@@ -54,19 +60,19 @@ jobs:
               open(path, "w").write(s[:i] + new + s[i:])
               print("[ok]", path)
 
-          # 1) fs/exec.c
+          # 1) fs/exec.c : execve (su redirect + ksud boot hook)
           edit("fs/exec.c", "static int do_execve_common(struct filename *filename,",
            "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n\n")
           edit("fs/exec.c", "\tif (IS_ERR(filename))\n\t\treturn PTR_ERR(filename);\n\n\t/*\n\t * We move the actual failure",
            "\t{\n\t\tint ksu_fd = AT_FDCWD, ksu_flags = 0;\n\t\tif (!IS_ERR(filename))\n\t\t\tksu_handle_execveat(&ksu_fd, &filename, &argv, &envp, &ksu_flags);\n\t}\n\n")
 
-          # 2) fs/open.c
+          # 2) fs/open.c : faccessat
           edit("fs/open.c", "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
            "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n\n")
           edit("fs/open.c", "\tif (mode & ~S_IRWXO)\t/* where's F_OK, X_OK, W_OK, R_OK? */",
            "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n\n")
 
-          # 3) fs/stat.c
+          # 3) fs/stat.c : stat + fstat (init.rc size)
           edit("fs/stat.c", "int vfs_fstat(unsigned int fd, struct kstat *stat)",
            "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\nextern void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr);\n\n")
           edit("fs/stat.c", "\t\terror = vfs_getattr(&f.file->f_path, stat);\n",
@@ -74,19 +80,19 @@ jobs:
           edit("fs/stat.c", "\tif ((flag & ~(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT |\n\t\t      AT_EMPTY_PATH)) != 0)\n\t\tgoto out;\n\n\tif (!(flag & AT_SYMLINK_NOFOLLOW))",
            "\tksu_handle_stat(&dfd, &filename, &flag);\n\n")
 
-          # 4) fs/read_write.c
+          # 4) fs/read_write.c : vfs_read (init.rc injection)
           edit("fs/read_write.c", "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)\n{",
            "extern bool ksu_vfs_read_hook __read_mostly;\nextern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n\n")
           edit("fs/read_write.c", "ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)\n{\n\tssize_t ret;\n\n",
            "\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n\n", after=True)
 
-          # 5) kernel/reboot.c
+          # 5) kernel/reboot.c : manager <-> kernel supercall
           edit("kernel/reboot.c", "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
            "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n\n")
           edit("kernel/reboot.c", "\t/* We only trust the superuser with rebooting the system. */",
            "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n\n")
 
-          # 6) security/security.c
+          # 6) security/security.c : setuid + key_permission (3.18 has no LSM_HOOK_INIT)
           edit("security/security.c", "int security_task_fix_setuid(struct cred *new, const struct cred *old,",
            "extern int ksu_task_fix_setuid(struct cred *new, const struct cred *old, int flags);\n\n")
           edit("security/security.c", "\treturn security_ops->task_fix_setuid(new, old, flags);",
@@ -146,10 +152,27 @@ jobs:
           zip -r9 ../KSU-H-KERNEL-on7xelte.zip * -x .git
           cp Image ../Image
 
+      - name: Repack boot.img with new kernel
+        run: |
+          set -e
+          [ -f boot.img ] || { echo "boot.img not found in repo, skipping"; exit 0; }
+          git clone --depth=1 https://github.com/osm0sis/mkbootimg mk
+          make -C mk CFLAGS="-Wno-error -O2"
+          mkdir -p unp
+          ./mk/unpackbootimg -i boot.img -o unp
+          P=unp/boot.img
+          RD=$(ls ${P}-ramdisk ${P}-ramdisk.* 2>/dev/null | head -1)
+          ARGS="--kernel Image --ramdisk $RD --cmdline \"$(cat ${P}-cmdline)\" --base $(cat ${P}-base) --pagesize $(cat ${P}-pagesize) --kernel_offset $(cat ${P}-kernel_offset) --ramdisk_offset $(cat ${P}-ramdisk_offset) --second_offset $(cat ${P}-second_offset) --tags_offset $(cat ${P}-tags_offset) --board \"$(cat ${P}-board)\""
+          [ -s ${P}-dt ] && ARGS="$ARGS --dt ${P}-dt"
+          eval ./mk/mkbootimg $ARGS -o new-boot.img
+          if tail -c 16 boot.img | grep -q SEANDROIDENFORCE; then printf 'SEANDROIDENFORCE' >> new-boot.img; fi
+          ls -la boot.img new-boot.img
+
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: KSU-H-KERNEL-on7xelte
           path: |
             KSU-H-KERNEL-on7xelte.zip
+            new-boot.img
             Image
