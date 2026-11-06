@@ -17,11 +17,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev ccache zip git curl xz-utils python3
 
-      - name: Get Linaro GCC 7.5 (same toolchain as H-KERNEL)
+      - name: Get GCC 4.9 toolchain (AOSP)
         run: |
-          curl -L -o gcc.tar.xz https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/aarch64-linux-gnu/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu.tar.xz
-          mkdir -p $HOME/gcc && tar -xf gcc.tar.xz -C $HOME/gcc --strip-components=1
-          $HOME/gcc/bin/aarch64-linux-gnu-gcc --version | head -1
+          git clone --depth=1 -b lineage-19.1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 $HOME/gcc
+          $HOME/gcc/bin/aarch64-linux-android-gcc --version | head -1
 
       - name: Clone H-KERNEL source
         run: |
@@ -104,7 +103,7 @@ jobs:
         working-directory: kernel
         run: |
           export ARCH=arm64
-          export CROSS_COMPILE=$HOME/gcc/bin/aarch64-linux-gnu-
+          export CROSS_COMPILE=$HOME/gcc/bin/aarch64-linux-android-
           export ANDROID_MAJOR_VERSION=q
           export ANDROID_PLATFORM_VERSION=10
           sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' scripts/dtc/dtc-lexer.lex.c_shipped
