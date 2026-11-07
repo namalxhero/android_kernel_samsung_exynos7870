@@ -4,40 +4,49 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "H-KERNEL branch (h-kernel_permissive or h-kernel_enforcing)"
-        default: "h-kernel_permissive"
+        description: "Branch of namalxhero/android_kernel_samsung_exynos7870 to build"
+        default: "master"
         required: true
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout repo (for boot.img)
+      - name: Checkout kernel source (your fork)
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          path: ksrc
+          fetch-depth: 1
 
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison flex libssl-dev ccache zip git curl xz-utils python3
+          sudo apt-get install -y bc bison flex libssl-dev ccache zip unzip git curl xz-utils python3
 
       - name: Get GCC 4.9 toolchain (AOSP)
         run: |
           git clone --depth=1 -b lineage-19.1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 $HOME/gcc
           $HOME/gcc/bin/aarch64-linux-android-gcc --version | head -1
 
-      - name: Clone H-KERNEL source
+      - name: Unzip boot.img (if uploaded as boot.zip)
         run: |
-          git clone --depth=1 -b "${{ inputs.branch }}" https://github.com/samsungexynos7870/android_kernel_samsung_exynos7870 ksrc
+          if [ -f ksrc/boot.zip ] && [ ! -f ksrc/boot.img ]; then
+            unzip -o ksrc/boot.zip -d ksrc
+          fi
+          ls -la ksrc/boot.img || echo "no boot.img in repo (repack step will be skipped)"
 
       - name: Add KernelSU (rsuntk legacy tag, supports 3.18)
         working-directory: ksrc
         run: |
-          git clone --depth=1 -b v3.2.2-10-legacy https://github.com/rsuntk/KernelSU KernelSU
-          rm -rf KernelSU/.git
+          if [ ! -d KernelSU ]; then
+            git clone --depth=1 -b v3.2.2-10-legacy https://github.com/rsuntk/KernelSU KernelSU
+            rm -rf KernelSU/.git
+          fi
           ln -sfn ../KernelSU/kernel drivers/kernelsu
-          echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-          sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          printf 'CONFIG_KSU=y\n# CONFIG_KSU_LSM_HOOKS is not set\n# CONFIG_KSU_DEBUG is not set\n' >> arch/arm64/configs/exynos7870-on7xelte_defconfig
+          grep -q 'kernelsu/' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          grep -q '^CONFIG_KSU=y' arch/arm64/configs/exynos7870-on7xelte_defconfig || printf 'CONFIG_KSU=y\n# CONFIG_KSU_LSM_HOOKS is not set\n# CONFIG_KSU_DEBUG is not set\n' >> arch/arm64/configs/exynos7870-on7xelte_defconfig
           sed -i 's/d_is_reg(/d_is_file(/' KernelSU/kernel/runtime/ksud.c
           sed -i 's/long ret = (long)ns_get_path(&ns_path, pid1_task, &mntns_operations);/long ret = -ENOSYS; ns_path.mnt = NULL; ns_path.dentry = NULL;/' KernelSU/kernel/infra/su_mount_ns.c
 
@@ -46,7 +55,7 @@ jobs:
         run: |
           cat > ksu_hooks.py <<'PYEOF'
           #!/usr/bin/env python3
-          # KernelSU manual hooks for Linux 3.18 (Exynos7870 H-KERNEL). Run from the kernel source root.
+          # KernelSU manual hooks for Linux 3.18 (Exynos7870). Run from the kernel source root.
           import sys
 
           def edit(path, anchor, new, after=False):
@@ -127,7 +136,7 @@ jobs:
           cat > anykernel.sh <<'AKEOF'
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=H-KERNEL V1.0 + KernelSU (J7 Prime)
+          kernel.string=Custom Kernel + KernelSU (J7 Prime)
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -149,13 +158,14 @@ jobs:
           dump_boot;
           write_boot;
           AKEOF
-          zip -r9 ../KSU-H-KERNEL-on7xelte.zip * -x .git
+          zip -r9 ../KSU-kernel-on7xelte.zip * -x .git
           cp Image ../Image
 
       - name: Repack boot.img with new kernel
         run: |
           set -e
-          [ -f boot.img ] || { echo "boot.img not found in repo, skipping"; exit 0; }
+          [ -f ksrc/boot.img ] || { echo "boot.img not found in repo, skipping"; exit 0; }
+          cp ksrc/boot.img boot.img
           git clone --depth=1 https://github.com/osm0sis/mkbootimg mk
           make -C mk CFLAGS="-Wno-error -O2"
           mkdir -p unp
@@ -171,8 +181,8 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: KSU-H-KERNEL-on7xelte
+          name: KSU-kernel-on7xelte
           path: |
-            KSU-H-KERNEL-on7xelte.zip
+            KSU-kernel-on7xelte.zip
             new-boot.img
             Image
