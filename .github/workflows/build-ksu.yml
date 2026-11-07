@@ -1,4 +1,4 @@
-name: Build KernelSU kernel (J7 Prime / on7xelte)
+name: Build Dark su (manager app + KernelSU kernel for J7 Prime)
 
 on:
   workflow_dispatch:
@@ -7,9 +7,103 @@ on:
         description: "H-KERNEL branch (h-kernel_permissive or h-kernel_enforcing)"
         default: "h-kernel_permissive"
         required: true
+      debug:
+        description: "Enable KernelSU debug logging (dmesg)"
+        type: boolean
+        default: true
 
 jobs:
-  build:
+  manager:
+    runs-on: ubuntu-22.04
+    outputs:
+      cert_size: ${{ steps.cert.outputs.size }}
+      cert_hash: ${{ steps.cert.outputs.hash }}
+    steps:
+      - name: Checkout repo (for darksu.jks and boot.img)
+        uses: actions/checkout@v4
+
+      - name: Clone KernelSU manager source (same tag as the kernel driver)
+        run: |
+          git clone -b v3.2.2-10-legacy https://github.com/rsuntk/KernelSU kmgr
+
+      - name: Rename app to Dark su
+        run: |
+          sed -i 's#<string name="app_name" translatable="false">KernelSU</string>#<string name="app_name" translatable="false">Dark su</string>#' kmgr/manager/app/src/main/res/values/strings.xml
+          grep -n app_name kmgr/manager/app/src/main/res/values/strings.xml
+
+      - name: Signing key (use darksu.jks from repo, or create one)
+        id: cert
+        env:
+          KS_PASS: darksu-local-key
+        run: |
+          if [ ! -f darksu.jks ]; then
+            echo "darksu.jks not found in repo, creating a new key"
+            keytool -genkeypair -keystore darksu.jks -alias darksu -keyalg RSA -keysize 2048 -validity 36500 -storepass "$KS_PASS" -keypass "$KS_PASS" -dname "CN=DarkSU, O=DarkSU, C=LK"
+          fi
+          cp darksu.jks kmgr/manager/darksu.jks
+          keytool -exportcert -alias darksu -keystore darksu.jks -storepass "$KS_PASS" > cert.der
+          echo "size=$(stat -c%s cert.der)" >> $GITHUB_OUTPUT
+          echo "hash=$(sha256sum cert.der | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          {
+            echo KEYSTORE_FILE=darksu.jks
+            echo KEYSTORE_PASSWORD=$KS_PASS
+            echo KEY_ALIAS=darksu
+            echo KEY_PASSWORD=$KS_PASS
+          } >> kmgr/manager/gradle.properties
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK r29
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+
+      - name: Build ksud (arm64 + armv7)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          cd kmgr
+          for T in aarch64-linux-android armv7-linux-androideabi; do
+            (
+              source .github/scripts/setup-rust-build.sh $T 26
+              cargo build --target $T --release --manifest-path ./userspace/ksud/Cargo.toml
+            )
+          done
+          mkdir -p manager/app/src/main/jniLibs/arm64-v8a manager/app/src/main/jniLibs/armeabi-v7a
+          cp target/aarch64-linux-android/release/ksud manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          cp target/armv7-linux-androideabi/release/ksud manager/app/src/main/jniLibs/armeabi-v7a/libksud.so
+
+      - name: Build manager APK
+        working-directory: kmgr/manager
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assembleRelease --stacktrace
+          ls -la app/build/outputs/apk/release/
+
+      - name: Upload Dark su APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkSu-manager
+          path: kmgr/manager/app/build/outputs/apk/release/*.apk
+
+      - name: Upload signing key (save it as darksu.jks in your repo)
+        uses: actions/upload-artifact@v4
+        with:
+          name: darksu-keystore
+          path: darksu.jks
+
+  kernel:
+    needs: manager
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repo (for boot.img)
@@ -18,19 +112,12 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison flex libssl-dev ccache zip unzip git curl xz-utils python3
+          sudo apt-get install -y bc bison flex libssl-dev ccache zip git curl xz-utils python3
 
       - name: Get GCC 4.9 toolchain (AOSP)
         run: |
           git clone --depth=1 -b lineage-19.1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 $HOME/gcc
           $HOME/gcc/bin/aarch64-linux-android-gcc --version | head -1
-
-      - name: Unzip boot.img (if uploaded as boot.zip)
-        run: |
-          if [ -f boot.zip ] && [ ! -f boot.img ]; then
-            unzip -o boot.zip
-          fi
-          ls -la boot.img || echo "no boot.img in repo (repack step will be skipped)"
 
       - name: Clone H-KERNEL source
         run: |
@@ -38,6 +125,10 @@ jobs:
 
       - name: Add KernelSU (rsuntk legacy tag, supports 3.18)
         working-directory: ksrc
+        env:
+          CERT_SIZE: ${{ needs.manager.outputs.cert_size }}
+          CERT_HASH: ${{ needs.manager.outputs.cert_hash }}
+          DEBUG_ON: ${{ inputs.debug }}
         run: |
           git clone --depth=1 -b v3.2.2-10-legacy https://github.com/rsuntk/KernelSU KernelSU
           rm -rf KernelSU/.git
@@ -46,6 +137,9 @@ jobs:
           sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
           printf 'CONFIG_KSU=y\n# CONFIG_KSU_LSM_HOOKS is not set\n# CONFIG_KSU_DEBUG is not set\n' >> arch/arm64/configs/exynos7870-on7xelte_defconfig
           sed -i 's/d_is_reg(/d_is_file(/' KernelSU/kernel/runtime/ksud.c
+          sed -i "/} apk_sign_keys\[\] = {/a\    { ${CERT_SIZE}, \"${CERT_HASH}\" }, // DARKSU" KernelSU/kernel/manager/apk_sign.c
+          grep -n DARKSU KernelSU/kernel/manager/apk_sign.c
+          if [ "$DEBUG_ON" = "true" ]; then sed -i 's/^# CONFIG_KSU_DEBUG is not set/CONFIG_KSU_DEBUG=y/' arch/arm64/configs/exynos7870-on7xelte_defconfig; fi
           sed -i 's/long ret = (long)ns_get_path(&ns_path, pid1_task, &mntns_operations);/long ret = -ENOSYS; ns_path.mnt = NULL; ns_path.dentry = NULL;/' KernelSU/kernel/infra/su_mount_ns.c
 
       - name: Apply KernelSU manual hooks (3.18)
@@ -134,7 +228,7 @@ jobs:
           cat > anykernel.sh <<'AKEOF'
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=H-KERNEL + KernelSU (J7 Prime)
+          kernel.string=H-KERNEL V1.0 + KernelSU (J7 Prime)
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -148,7 +242,7 @@ jobs:
           supported.versions=
           supported.patchlevels=
           '; }
-          block=/dev/block/platform/13540000.dwmmc0/by-name/BOOT;
+          block=/dev/block/mmcblk0p10;
           is_slot_device=0;
           ramdisk_compression=auto;
           patch_vbmeta_flag=auto;
